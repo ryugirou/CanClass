@@ -1,30 +1,32 @@
 /*
  * CanClass.cpp
  *
- *  Created on: Jun 30, 2019
- *      Author: ryu
+ *  Created on: 2020/10/23
+ *      Author: ryuni
  */
-#include "stm32f1xx_hal.h"
+
 #include "CanClass.hpp"
+#include "main.h"
+
+extern "C" {
+	CAN_HandleTypeDef hcan;
+};
 
 CanClass::CanClass()
 {
 }
 
-void CanClass::init(void)
+void CanClass::init(uint32_t id,uint32_t bitrate)
 {
-    // default to 125 kbit/s
-    prescaler = 48;
-    hcan.Instance = CAN1;
+	pclk1 = HAL_RCC_GetPCLK1Freq();
+	this->id = id;
     bus_state = OFF_BUS;
 
 	tx_header.RTR = CAN_RTR_DATA;
 	tx_header.IDE = CAN_ID_STD;
-	tx_header.StdId = 0xfff;
 	tx_header.ExtId = 0;
-	tx_header.DLC = 8;
 
-	can_set_bitrate(CAN_BITRATE_500K);
+	can_set_bitrate(bitrate);
 	can_set_silent(0);
 	can_enable();
 }
@@ -50,6 +52,7 @@ void CanClass::can_set_filter(uint32_t id, uint32_t mask)
     filter.FilterScale = CAN_FILTERSCALE_32BIT;
     filter.FilterBank = 0;
     filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+
     filter.SlaveStartFilterBank = 0;
     filter.FilterActivation = ENABLE;
 
@@ -65,21 +68,22 @@ void CanClass::can_enable(void)
     {
         hcan.Init.Prescaler = prescaler;
         hcan.Init.Mode = CAN_MODE_NORMAL;
+
+        //Sample-Point at: (1+15)/(1+15+2)=88.9% where CANopen states "The location of the sample point must be as close as possible to 87,5 % of the bit time."
         hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
-        hcan.Init.TimeSeg1 = CAN_BS1_4TQ;
-        hcan.Init.TimeSeg2 = CAN_BS2_3TQ;
+        hcan.Init.TimeSeg1 = CAN_BS1_15TQ;
+        hcan.Init.TimeSeg2 = CAN_BS2_2TQ;
+
         hcan.Init.TimeTriggeredMode = DISABLE;
-        hcan.Init.AutoBusOff = DISABLE;
+        hcan.Init.AutoBusOff = ENABLE;
         hcan.Init.AutoWakeUp = DISABLE;
         hcan.Init.AutoRetransmission = ENABLE;
         hcan.Init.ReceiveFifoLocked = DISABLE;
         hcan.Init.TransmitFifoPriority = DISABLE;
-        //hcan.pTxMsg = NULL;
+
         HAL_CAN_Init(&hcan);
         bus_state = ON_BUS;
-        can_set_filter(0, 0);
-
-
+        can_set_filter(id, 0x07fc);//reserve 4 id
 
         /* Start the CAN peripheral */
         if (HAL_CAN_Start(&hcan) != HAL_OK)
@@ -95,8 +99,6 @@ void CanClass::can_enable(void)
           Error_Handler();
         }
     }
-
-    GPIOB->BSRR = GPIO_BSRR_BS1;
 }
 
 void CanClass::can_disable(void)
@@ -107,48 +109,31 @@ void CanClass::can_disable(void)
         hcan.Instance->MCR |= CAN_MCR_RESET;
         bus_state = OFF_BUS;
     }
-
-    GPIOB->BSRR = GPIO_BSRR_BR1;
-    GPIOC->BSRR = GPIO_BSRR_BR13;
 }
 
-void CanClass::can_set_bitrate(enum can_bitrate bitrate)
+void CanClass::can_set_bitrate(uint32_t bitrate)
 {
     if (bus_state == ON_BUS)
     {
         // cannot set bitrate while on bus
+    	Error_Handler();
         return;
     }
 
     switch (bitrate)
     {
-        case CAN_BITRATE_10K:
-            prescaler = 450;
-            break;
-        case CAN_BITRATE_20K:
-            prescaler = 225;
-            break;
-        case CAN_BITRATE_50K:
-            prescaler = 90;
-            break;
-        case CAN_BITRATE_100K:
-            prescaler = 45;
-            break;
-        case CAN_BITRATE_125K:
-            prescaler = 36;
-            break;
-        case CAN_BITRATE_250K:
-            prescaler = 18;
-            break;
-        case CAN_BITRATE_500K:
-            prescaler = 9;
-            break;
-        case CAN_BITRATE_750K:
-            prescaler = 6;
-            break;
-        case CAN_BITRATE_1000K:
-            prescaler = 4;
-            break;
+        case 10000:
+        case 20000:
+        case 50000:
+        case 100000:
+        case 125000:
+        case 250000:
+        case 500000:
+        case 1000000:
+        	prescaler = pclk1/18/bitrate;
+        	break;
+        default:
+        	Error_Handler();
     }
 }
 
@@ -176,10 +161,6 @@ uint32_t CanClass::can_tx(CAN_TxHeaderTypeDef *tx_header, uint8_t (&buf)[CAN_MTU
     uint32_t tx_mailbox;
     status = HAL_CAN_AddTxMessage(&hcan, tx_header, buf, &tx_mailbox);
 
-    GPIOC->BSRR=GPIO_BSRR_BS13;
-    GPIOC->BSRR=GPIO_BSRR_BR13;
-
-    //led_on();
     return status;
 }
 
@@ -189,7 +170,6 @@ uint32_t CanClass::can_rx(CAN_RxHeaderTypeDef *rx_header, uint8_t (&buf)[CAN_MTU
 
     status = HAL_CAN_GetRxMessage(&hcan, CAN_RX_FIFO0, rx_header, buf);
 
-    //led_on(); later
     return status;
 }
 
@@ -214,7 +194,7 @@ void CanClass::led_on(void)
 	// This prevents a solid status LED on a busy canbus
 	if(led_laston == 0 && HAL_GetTick() - led_lastoff > LED_DURATION)
 	{
-	    GPIOC->BSRR = GPIO_BSRR_BS13;
+	    HAL_GPIO_TogglePin(LED_CAN_GPIO_Port, LED_CAN_Pin);
 		led_laston = HAL_GetTick();
 	}
 }
@@ -225,7 +205,7 @@ void CanClass::led_process(void)
 	// If LED has been on for long enough, turn it off
 	if(led_laston > 0 && HAL_GetTick() - led_laston > LED_DURATION)
 	{
-        GPIOC->BSRR = GPIO_BSRR_BR13;
+        HAL_GPIO_TogglePin(LED_CAN_GPIO_Port,LED_CAN_Pin);
 		led_laston = 0;
 		led_lastoff = HAL_GetTick();
 	}
